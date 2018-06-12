@@ -87,6 +87,13 @@ namespace Ses.Subscriptions
                 try
                 {
                     var anyDispatched = await Poller.Execute(_pollerContext, _disposedTokenSource.Token);
+
+                    if (anyDispatched)
+                    {
+                        // extend period of work duration
+                        _startedAt.Set(DateTime.UtcNow);
+                    }
+
                     _runnerTimer.Interval = _timeoutCalc.CalculateNext(anyDispatched);
                     _runnerTimer.Start();
                 }

@@ -3,7 +3,6 @@ using System.Data;
 using System.Data.SqlClient;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Timers;
 using Ses.Abstracts;
 using Ses.Abstracts.Extensions;
 
@@ -21,20 +20,37 @@ namespace Ses.MsSql
         private readonly InterlockedDateTime _startedAt;
         private readonly int _batchSize;
 
-        public Linearizer(string connectionString, ILogger logger, TimeSpan timeout, TimeSpan durationWork, int batchSize)
+        public Linearizer(string connectionString, ILogger logger, TimeSpan timeout, TimeSpan durationWork, int batchSize = 5000)
         {
             _logger = logger;
             _connectionString = PrepareConnectionString(connectionString);
             _timer = new System.Timers.Timer(timeout.TotalMilliseconds) { AutoReset = false, SynchronizingObject = null,  Site = null };
-            _timer.Elapsed += OnTimerElapsed;
+            _timer.Elapsed += (s, e) => Execute().SwallowException();
             _durationWork = durationWork;
             _batchSize = batchSize;
             _startedAt = new InterlockedDateTime(DateTime.MaxValue);
         }
 
-        private void OnTimerElapsed(object o, ElapsedEventArgs args)
+        public async Task StartOnce()
         {
-            Execute().SwallowException();
+            try
+            {
+                if (_isRunning) return;
+                _isRunning = true;
+                while (true)
+                {
+                    var shouldDoMoreWork = await Linearize(_disposedTokenSource.Token).NotOnCapturedContext();
+                    if (!shouldDoMoreWork) break;
+                }
+            }
+            catch (Exception e)
+            {
+                _logger.Error(e.ToString());
+            }
+            finally
+            {
+                _isRunning = false;
+            }
         }
 
         private static string PrepareConnectionString(string connectionString)
@@ -69,35 +85,38 @@ namespace Ses.MsSql
             }
             else
             {
-                await Linearize();
+                try
+                {
+                    while (true)
+                    {
+                        var shouldDoMoreWork = await Linearize(_disposedTokenSource.Token).NotOnCapturedContext();
+                        if (!shouldDoMoreWork) break;
+                    }
+                }
+                catch (Exception e)
+                {
+                    _logger.Error(e.ToString());
+                }
+                finally
+                {
+                    _timer?.Start();
+                }
             }
         }
 
         private bool ShouldStop() => (DateTime.UtcNow - _startedAt.Value) > _durationWork;
 
-        private async Task Linearize()
+        private async Task<bool> Linearize(CancellationToken token)
         {
-            try
+            if (_connectionString == null) return false;
+
+            using (var cnn = new SqlConnection(_connectionString))
+            using (var cmd = await cnn.OpenAndCreateCommandAsync(SqlQueries.Linearize.Query, _disposedTokenSource.Token).NotOnCapturedContext())
             {
-                if (_connectionString == null) return;
-                using (var cnn = new SqlConnection(_connectionString))
-                using (var cmd = await cnn.OpenAndCreateCommandAsync(SqlQueries.Linearize.Query, _disposedTokenSource.Token).NotOnCapturedContext())
-                {
-                    cmd.CommandTimeout = 60000;
-                    cmd.AddInputParam(batchSizeParamName, DbType.Int32, _batchSize);
-                    await cmd
-                        .ExecuteNonQueryAsync(_disposedTokenSource.Token)
-                        .NotOnCapturedContext();
-                    cnn.Close();
-                }
-            }
-            catch (Exception e)
-            {
-                _logger.Error(e.ToString());
-            }
-            finally
-            {
-                _timer.Start();
+                cmd.CommandTimeout = 60000;
+                cmd.AddInputParam(batchSizeParamName, DbType.Int32, _batchSize);
+                var result = await cmd.ExecuteScalarAsync(token).NotOnCapturedContext();
+                return result != null && result != DBNull.Value && (bool)result;
             }
         }
 
